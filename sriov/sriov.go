@@ -10,10 +10,15 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containernetworking/cni/pkg/ipam"
-	"github.com/containernetworking/cni/pkg/ns"
+	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
+
 	"github.com/containernetworking/cni/pkg/skel"
+	//"github.com/containernetworking/cni/pkg/types"
+	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
+	"github.com/containernetworking/plugins/pkg/ipam"
+	"github.com/containernetworking/plugins/pkg/ns"
+
 	"github.com/j-keck/arping"
 	"github.com/vishvananda/netlink"
 
@@ -210,6 +215,11 @@ func releaseVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 	})
 }
 
+func cmdCheck(args *skel.CmdArgs) error {
+
+	return nil
+}
+
 func cmdAdd(args *skel.CmdArgs) error {
 	n, err := LoadConf(args.StdinData, args.Args)
 	if err != nil {
@@ -222,7 +232,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 	defer netns.Close()
 
-	if n.Net.PFOnly != true {
+	if !n.Net.PFOnly {
 		if err = setupVF(n, args.IfName, netns); err != nil {
 			return err
 		}
@@ -233,12 +243,29 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 
 	// run the IPAM plugin and get back the config to apply
-	result, err := ipam.ExecAdd(n.Net.IPAM.Type, args.StdinData)
+	r, err := ipam.ExecAdd(n.Net.IPAM.Type, args.StdinData)
 	if err != nil {
 		return err
 	}
-	if result.IP4 == nil {
-		return errors.New("IPAM plugin returned missing IPv4 config")
+
+	// Convert whatever the IPAM result was into the current Result type
+	result, err := current.NewResultFromResult(r)
+	if err != nil {
+		return err
+	}
+
+	if len(result.IPs) == 0 {
+		return errors.New("IPAM plugin returned missing IP config")
+	}
+
+	result.Interfaces = []*current.Interface{{
+		Name:    args.IfName,
+		Mac:     string(n.Args.MAC),
+		Sandbox: netns.Path(),
+	}}
+	for _, ipc := range result.IPs {
+		// All addresses apply to the container interface (move from host)
+		ipc.Interface = current.Int(0)
 	}
 
 	err = netns.Do(func(_ ns.NetNS) error {
@@ -250,15 +277,10 @@ func cmdAdd(args *skel.CmdArgs) error {
 		if err != nil {
 			return err
 		}
-		if result.IP4 != nil {
-			if err := arping.GratuitousArpOverIface(result.IP4.IP.IP, *contEth); err != nil {
-				return err
-			}
-		}
 
-		if result.IP6 != nil {
-			if err := arping.GratuitousArpOverIface(result.IP6.IP.IP, *contEth); err != nil {
-				return err
+		for _, ipc := range result.IPs {
+			if ipc.Address.IP.To4() != nil {
+				_ = arping.GratuitousArpOverIface(ipc.Address.IP, *contEth)
 			}
 		}
 
@@ -294,7 +316,7 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 	defer netns.Close()
 
-	if n.Net.PFOnly != true {
+	if !n.Net.PFOnly {
 		if err = releaseVF(n, args.IfName, netns); err != nil {
 			return err
 		}
@@ -383,5 +405,5 @@ func getVFDeviceName(master string, vf int) (string, error) {
 }
 
 func main() {
-	skel.PluginMain(cmdAdd, cmdDel, version.Legacy)
+	skel.PluginMain(cmdAdd, cmdCheck, cmdDel, version.All, bv.BuildString("sriov"))
 }
